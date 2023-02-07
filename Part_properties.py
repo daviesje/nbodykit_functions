@@ -1,10 +1,16 @@
 import bigfile as bf
 import numpy as np
 from astropy import cosmology, units as U, cosmology as C
+
 from nbodykit.lab import BigFileCatalog
 import dask.array as da
 from mpi4py import MPI
 from matplotlib import pyplot as plt
+
+import nbodykit
+nbodykit.use_mpi()
+nbodykit.set_options(dask_chunk_size=1024*1024*8)
+nbodykit.setup_logging(log_level='info')
 
 #nbodykit has annoying deprecation warnings
 import warnings
@@ -47,8 +53,10 @@ def parse_property(dset, prop, **kwargs):
     elif prop == 'Overdensity':
         arr = dset['Density'] * dset.attrs['UnitMass_in_g'] / dset.attrs['UnitLength_in_cm']**3
         arr = (arr / mean_bary_dens_cgs) #should be unitless
-    elif prop == 'posf_sum':
-        arr = dset['position'].sum(axis=1)
+    elif prop == 'Pos_flat':
+        arr = dset['Position'].reshape((dset["Position"].size,))
+    elif prop == 'Vel_flat':
+        arr = dset['Velocity'].reshape((dset["Velocity"].size,))
     else:
         try:
             arr = dset[prop]
@@ -61,20 +69,50 @@ def parse_property(dset, prop, **kwargs):
 def print_property_sums(bfile,ptype='0/'):
     dset = BigFileCatalog(f'{bfile}',dataset=ptype)
     comm = dset.comm
+    if comm.rank == 0:
+        logger.info(f'Printing sums for file {bfile}')
+        logger.info(f'-----------------------------')
     for col in dset.columns:
-        dsum = dset[col].sum.compute()
+        dsum = dset[col].sum().compute()
         csum = comm.allreduce(dsum,op=MPI.SUM)
 
+        dmin = dset[col].min().compute()
+        cmin = comm.allreduce(dmin,op=MPI.MIN)
+        
+        dmax = dset[col].max().compute()
+        cmax = comm.allreduce(dmax,op=MPI.MAX)
+        
         cavg = csum / dset.csize
         if comm.rank == 0:
-            logger.info(f'Property "{col}" has sum {csum:.8e} avg {cavg:.8e}')
+            logger.info(f'Property "{col}" has sum {csum:.8e} avg {cavg:.8e} min {cmin:.8e} max {cmax:.8e}')
 
 
+def print_property_diffs(bfile1,bfile2,ptype='0/'):
+    dset1 = BigFileCatalog(f'{bfile1}',dataset=ptype)
+    comm = dset1.comm
+    dset2 = BigFileCatalog(f'{bfile2}',dataset=ptype)
+    if comm.rank == 0:
+        logger.info(f'Printing log differences for files {bfile1}, {bfile2}')
+        logger.info(f'-----------------------------')
+    for col in dset.columns:
+        if col in ["Weight","Value"]:
+            continue
+
+        #NOTE: ASSUMING IDENTICAL ID ORDER
+        logdiff = da.log10(dset1[col]/dset2[col])
+        dmean = logdiff.mean().compute()
+        drms = da.sqrt((logdiff*logdiff).mean()).compute()
+        cmean = comm.allreduce(dmean,op=MPI.SUM)
+        crms = comm.allreduce(drms,op=MPI.SUM)
+        
+        if comm.rank == 0:
+            logger.info(f'Property "{col}" has mean logdiff {cmean:.8e} rms {crms:.8e}')
 
 #properties should be a list of strings containing the columns we want to compare
 #limits should be a ndarray (n_properties,2) or something that can be turned into one
 #log should be a boolean list of each property to be binned in logspace (True) or linspace (False)
 def get_particle_ndhist(bfile,properties,limits,log,ptype='0/',nbins=50):
+    logger.info(f'making particle ndhist for {properties}')
     try:
         limits = np.asarray(limits)
     except:
@@ -101,9 +139,41 @@ def get_particle_ndhist(bfile,properties,limits,log,ptype='0/',nbins=50):
 
     return hist,edges
 
-#same as above but returns a logdiff histogram between two datasets
+#same as above but returns list of 1d histograms
+def get_particle_1dhist(bfile,properties,limits,log,ptype='0/',nbins=50):
+    logger.info(f'making particle 1dhists for {properties}')
+    try:
+        limits = np.asarray(limits)
+    except:
+        raise ValueError("ndhist limits should be array-like")
+
+    if limits.shape != (len(properties),2):
+        raise ValueError("ndhist limits should have shape (n_properties,2)")
+
+    dset = BigFileCatalog(f'{bfile}',dataset=ptype)
+    comm = dset.comm
+    edges_in = np.array([np.logspace(np.log10(l[0]),np.log10(l[1]),num=nbins) if o else np.linspace(l[0],l[1],num=nbins) for l,o in zip(limits,log)])
+
+    hist_arr = np.zeros((len(properties),nbins-1))
+    edge_arr = np.zeros((len(properties),nbins))
+    for i,prop in enumerate(properties):
+        logger.info(f'starting {prop}')
+        data = parse_property(dset,prop)
+        buf,edges = da.histogram(data,edges_in[i])
+
+        hist = buf.compute()
+
+        #each rank has a subset of particles, so summing the histograms will give the final result
+        hist = comm.allreduce(hist,op=MPI.SUM)
+        hist_arr[i,:] = hist
+        edge_arr[i,:] = edges
+
+    return hist_arr,edge_arr
+
+#logdiff histogram between two datasets
 #NOTE: UNFINISHED FOR COMPARING MODELS/SNAPSHOTS, JUST USE FOR COMPRESSION TEST
 def get_diff_ndhist(bfiles,properties,limits,ptype='0/',nbins=100):
+    logger.info(f'making log difference ndhist for {properties}')
     try:
         limits = np.asarray(limits)
     except:
@@ -177,9 +247,48 @@ def get_diff_ndhist(bfiles,properties,limits,ptype='0/',nbins=100):
 
     return hist,edges
     
+def get_diff_1dhist(bfiles,properties,limits,ptype='0/',nbins=100):
+    logger.info(f'making log difference 1dhist for {properties}')
+    try:
+        limits = np.asarray(limits)
+    except:
+        raise ValueError("ndhist limits should be array-like")
+
+    if limits.shape != (len(properties),2) or len(bfiles) != 2:
+        raise ValueError("ndhist limits should have shape (n_properties,2), need 2 bigfiles")
+
+    dset1 = BigFileCatalog(f'{bfiles[0]}',dataset=ptype)
+    comm = dset1.comm
+    dset2 = BigFileCatalog(f'{bfiles[1]}',dataset=ptype)
+    
+    #These limits are already in logspace (see below difference)
+    edges_in = np.array([np.linspace(l[0],l[1],num=nbins) for l in limits])
+    #logger.info(f"edges {edges_in}")
+
+    #NOTE: see ndhist function comments for future model comparison / ID matching
+
+    hist_arr = np.zeros((len(properties),nbins-1))
+    edge_arr = np.zeros((len(properties),nbins))
+    for i,prop in enumerate(properties):
+        logger.info(f'starting {prop}')
+        data1 = parse_property(dset1,prop)
+        data2 = parse_property(dset2,prop)
+        datad = da.log10(data1/data2)
+
+        buf,edges = da.histogram(datad,edges_in[i])
+        hist = buf.compute()
+        
+        #each rank has a subset of particles, so summing the histograms will give the final result
+        hist = comm.allreduce(hist,op=MPI.SUM)
+        hist_arr[i,:] = hist
+        edge_arr[i,:] = edges
+
+    return hist_arr,edge_arr
+
+
 #plot the marginalised histograms from an ND histogram
 #CALL ON ONE RANK
-def plot_hists(hist,edges,titles,log):
+def plot_hists(hist,edges,titles,log,nd=False):
     #try to make a nice aspect plot
     comm = MPI.COMM_WORLD
     if comm.rank != 0:
@@ -189,7 +298,8 @@ def plot_hists(hist,edges,titles,log):
     aspect = 1.
     nrow = 1
     ncol = 1
-    for i in range(len(hist.shape)):
+    hist_iter = range(len(hist.shape) if nd else hist.shape[0])
+    for i in hist_iter:
         if i+1 > nrow*ncol:
             if aspect > aspect_target:
                 nrow += 1
@@ -203,13 +313,18 @@ def plot_hists(hist,edges,titles,log):
     fig,axs = plt.subplots(figsize=(fw, fh),nrows=nrow,ncols=ncol)
     axs = axs.flatten()
 
-    for i in range(len(hist.shape)):
-        #sum over all other axes
-        ax_list = [j for j in range(len(hist.shape))]
-        ax_list.remove(i)
-        logger.info(f'axes {i} sum axes {ax_list}')
-        logger.info(f'edges {edges}')
-        m_hist = hist.sum(axis=tuple(ax_list))
+    hist_iter = range(len(hist.shape) if nd else len(hist))
+
+    for i in hist_iter:
+        #sum over all other axes if n_dimensional
+        if nd:
+            ax_list = [j for j in range(len(hist.shape))]
+            ax_list.remove(i)
+            # logger.info(f'axes {i} sum axes {ax_list}')
+            # logger.info(f'edges {edges}')
+            m_hist = hist.sum(axis=tuple(ax_list))
+        else:
+            m_hist = hist[i]
 
         centres = edges[i][:-1] + np.diff(edges[i])/2 if not log[i] else edges[i][:-1] * np.exp(np.diff(np.log(edges[i])))
 
