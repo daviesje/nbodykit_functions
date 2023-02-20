@@ -94,19 +94,24 @@ def print_property_diffs(bfile1,bfile2,ptype='0/'):
     if comm.rank == 0:
         logger.info(f'Printing log differences for files {bfile1}, {bfile2}')
         logger.info(f'-----------------------------')
-    for col in dset.columns:
-        if col in ["Weight","Value"]:
+    for col in dset1.columns:
+        if col in ["Weight","Value","Selection"]:
             continue
 
         #NOTE: ASSUMING IDENTICAL ID ORDER
-        logdiff = da.log10(dset1[col]/dset2[col])
-        dmean = logdiff.mean().compute()
-        drms = da.sqrt((logdiff*logdiff).mean()).compute()
+        #logdiff = da.log10(dset2[col]/dset1[col])
+        diff = 2*(dset2[col] - dset1[col])/(dset2[col] + dset1[col])
+        
+        #only nans occur due to both datasets == zero, since these are the same I want to count them as no difference
+        #+- infinity shouldn't occur, since we aren't logarithming anything
+        diff = da.nan_to_num(diff)
+        dmean = da.mean(diff).compute()
+        drms = da.sqrt(da.mean(diff**2)).compute()
         cmean = comm.allreduce(dmean,op=MPI.SUM)
         crms = comm.allreduce(drms,op=MPI.SUM)
         
         if comm.rank == 0:
-            logger.info(f'Property "{col}" has mean logdiff {cmean:.8e} rms {crms:.8e}')
+            logger.info(f'Property "{col}" has mean fractional diff {cmean:.8e} rms {crms:.8e}')
 
 #properties should be a list of strings containing the columns we want to compare
 #limits should be a ndarray (n_properties,2) or something that can be turned into one
@@ -259,11 +264,11 @@ def get_diff_1dhist(bfiles,properties,limits,ptype='0/',nbins=100):
 
     dset1 = BigFileCatalog(f'{bfiles[0]}',dataset=ptype)
     comm = dset1.comm
+    npart = dset1.csize
     dset2 = BigFileCatalog(f'{bfiles[1]}',dataset=ptype)
     
     #These limits are already in logspace (see below difference)
     edges_in = np.array([np.linspace(l[0],l[1],num=nbins) for l in limits])
-    #logger.info(f"edges {edges_in}")
 
     #NOTE: see ndhist function comments for future model comparison / ID matching
 
@@ -273,8 +278,10 @@ def get_diff_1dhist(bfiles,properties,limits,ptype='0/',nbins=100):
         logger.info(f'starting {prop}')
         data1 = parse_property(dset1,prop)
         data2 = parse_property(dset2,prop)
-        datad = da.log10(data1/data2)
-
+        
+        datad = 2*(data2 - data1)/(data2 + data1)
+        datad = da.nan_to_num(datad)        
+        
         buf,edges = da.histogram(datad,edges_in[i])
         hist = buf.compute()
         
@@ -282,6 +289,7 @@ def get_diff_1dhist(bfiles,properties,limits,ptype='0/',nbins=100):
         hist = comm.allreduce(hist,op=MPI.SUM)
         hist_arr[i,:] = hist
         edge_arr[i,:] = edges
+        logger.info(f"histogrammed {hist.sum()} particles of {npart}")
 
     return hist_arr,edge_arr
 

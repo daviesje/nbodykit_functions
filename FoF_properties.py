@@ -30,11 +30,12 @@ from matplotlib.lines import Line2D
 from matplotlib import gridspec
 
 plt.rcParams["font.family"] = "serif"
-plt.rcParams["font.size"] = 10
-plt.rcParams["xtick.labelsize"] = 10
-plt.rcParams["ytick.labelsize"] = 10
+plt.rcParams["font.size"] = 8
+plt.rcParams["xtick.labelsize"] = 8
+plt.rcParams["ytick.labelsize"] = 8
 plt.rcParams["legend.fontsize"] = 8
 plt.rcParams["text.usetex"] = False
+plt.rcParams["axes.formatter.limits"] = (-2, 3)
 
 from astropy import cosmology, constants as C, units as U
 #Astrid cosmology
@@ -681,7 +682,7 @@ def plot_zr(datadir,redshifts,properties,zr_targets,mass_targets,reion_path=None
     
     #TODO: generalise labels & limits to all properties
     plabels = [r'$ M_{\mathrm{gas}}/M_{\mathrm{halo}} $'
-            ,r'$ M_{*}/M_{\mathrm{gas}} $'
+            ,r'$ M_{*}/M_{\mathrm{halo}} $'
             ,r'$\mathrm{SFR} / M_{*} (t_H^{-1})$']
     #ylims = np.array[(0.13,0.17),(1e-3,2e-2),(1e0,2e1)]
     mlabels = [rf'$M = {{{m:.1e}}}$' for m in mass_targets]
@@ -714,18 +715,18 @@ def plot_zr(datadir,redshifts,properties,zr_targets,mass_targets,reion_path=None
         for im,cm in enumerate(condition_mass):
             for iz,cz in enumerate(condition_zr):
                 sel = cm & cz & nonzero
-                dz_plot_data[im,iz,:,i] += fofdata[:,sel].sum(axis=-1)
-                dz_plot_counts[im,iz,:,i] += fofdata[0,sel].size
+                dz_plot_data[im,iz,:,i] += fofdata[:,sel].sum(axis=-1) #sum of property binned in z,m,zr
+                dz_plot_counts[im,iz,:,i] += fofdata[0,sel].size #number of halos in selection
 
     dz_plot_data = comm.allreduce(dz_plot_data,op=MPI.SUM)
     dz_plot_counts = comm.allreduce(dz_plot_counts,op=MPI.SUM)
     dz_plot_counts[dz_plot_counts<=0] = 1 #it will be zero anyway
-    dz_plot_data /= dz_plot_counts
+    dz_plot_data /= dz_plot_counts #turn sums to averages in mass,zr bin
 
     if comm.rank == 0:
         nrows = len(properties)-2
         ncols = len(mass_targets)
-        fsize = (8,nrows/ncols*8)
+        fsize = (8,nrows/ncols*6)
         gs = gridspec.GridSpec(nrows=nrows,ncols=ncols)
 
         logger.info(f'{dz_plot_data.min(axis=(0,1,3))},{dz_plot_data.mean(axis=(0,1,3))},{dz_plot_data.max(axis=(0,1,3))}')
@@ -770,9 +771,11 @@ def plot_zr(datadir,redshifts,properties,zr_targets,mass_targets,reion_path=None
 
         axs2[0].legend()
         fig.subplots_adjust(left=0.08,right=0.98,top=0.95,bottom=0.08,hspace=0,wspace=0.2)
-        fig2.subplots_adjust(left=0.2,right=0.98,top=0.9,bottom=0.13,hspace=0)
+        fig2.subplots_adjust(left=0.2,right=0.98,top=0.95,bottom=0.1,hspace=0)
         fig.savefig('./fof_grid_zr.png')
         fig2.savefig('./fof_zr_low.png')
+        fig.savefig('./fof_grid_zr.pdf')
+        fig2.savefig('./fof_zr_low.pdf')
 
 
 #plot galaxy property correlations at one snapshot
